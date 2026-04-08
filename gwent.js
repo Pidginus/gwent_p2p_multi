@@ -498,26 +498,46 @@ class Player {
 		this.passed = hasPassed;
 	}
 	
-	// Sets up board for turn
-	async startTurn(){
-		document.getElementById("stats-" + this.tag).classList.add("current-turn");
-		if (this.leaderAvailable)
-			this.elem_leader.children[1].classList.remove("hide");
-		
-		if (this === player_me) {
-			document.getElementById("pass-button").classList.remove("noclick");
-		}
-		
-		if (this.controller instanceof ControllerAI) {
-			await this.controller.startTurn(this);
-		}
-	}
+// Sets up board for turn
+    async startTurn(){
+        // FIX: Remove the turn indicator from the opponent so they don't both stay lit up!
+        document.getElementById("stats-" + this.opponent().tag).classList.remove("current-turn");
+        
+        document.getElementById("stats-" + this.tag).classList.add("current-turn");
+        
+        if (this.leaderAvailable)
+            this.elem_leader.children[1].classList.remove("hide");
+        
+        // FIX: Lock the pass button if it is NOT our turn!
+        if (this === player_me) {
+            document.getElementById("pass-button").classList.remove("noclick");
+        } else {
+            document.getElementById("pass-button").classList.add("noclick");
+        }
+        
+        // MULTIPLAYER MOD: Prevent AI from acting if we are connected to a human!
+        let isMultiplayer = (typeof connection !== 'undefined' && connection && connection.open);
+        
+        if (this.controller instanceof ControllerAI && !isMultiplayer) {
+            await this.controller.startTurn(this);
+        } else if (isMultiplayer && this === player_op) {
+            console.log("Network: Opponent's turn. Waiting for them to make a move...");
+        }
+    }
 	
-	// Passes the round and ends the turn
-	passRound(){
-		this.setPassed(true);
-		this.endTurn();
-	}
+// Passes the round and ends the turn
+    passRound(){
+        this.setPassed(true);
+        
+        // MULTIPLAYER MOD: Tell the opponent we passed!
+        // We check "this === player_me" to ensure we only broadcast our own clicks
+        if (typeof connection !== 'undefined' && connection && connection.open && this === player_me) {
+            connection.send({ type: 'PASS_TURN' });
+            console.log("Network: Broadcasted PASS_TURN");
+        }
+        
+        this.endTurn();
+    }
 	
 	// Plays a scorch card
 	async playScorch(card){
@@ -529,10 +549,22 @@ class Player {
 		await this.playCardAction(card, async () => await board.moveTo(card, row, this.hand));
 	}
 	
-	// Plays a card to the board
-	async playCard(card){
-		await this.playCardAction(card, async () => await card.autoplay(this.hand));
-	}
+async playCard(card) {
+        // MULTIPLAYER MOD: Broadcast which card we are playing
+        // Removed the strict 'connection.open' check as PeerJS can sometimes mask it
+        if (typeof connection !== 'undefined' && connection !== null && this === player_me) {
+            let cardId = typeof card.id === 'function' ? String(card.id()) : String(card.id || card.index);
+            console.log("Network: Broadcasting PLAY_CARD for ID:", cardId);
+            connection.send({ 
+                type: 'PLAY_CARD', 
+                cardIndex: cardId 
+            });
+        }
+
+        await this.playCardAction(card, async () => {
+            await card.autoplay(this.hand);
+        });
+    }
 	
 	// Shows a preview of the card being played, plays it to the board and ends the turn
 	async playCardAction(card, action){
@@ -1313,60 +1345,196 @@ class Game {
 		}
 	}
 	
-	// Sets initializes player abilities, player hands and redraw
-	async startGame() {
-		ui.toggleMusic_elem.classList.remove("music-customization");
-		this.initPlayers(player_me, player_op);
-		await Promise.all([...Array(10).keys()].map( async () => {
-			await player_me.deck.draw(player_me.hand);
-			await player_op.deck.draw(player_op.hand);
-		}));
-		
-		await this.runEffects(this.gameStart);
-		if (!this.firstPlayer)
-			this.firstPlayer = await this.coinToss();
-		this.initialRedraw();
-	}
+// Sets initializes player abilities, player hands and redraw
+async startGame() {
+    if (this.isAlreadyStarted) return;
+    this.isAlreadyStarted = true;
+
+    ui.toggleMusic_elem.classList.remove("music-customization");
+    this.initPlayers(player_me, player_op);
+
+    if (window.isHost) {
+        console.log("Host: Syncing deck tops before drawing...");
+        
+        // Grab the deck arrays safely
+        const myDeckArr = player_me.deck.cards || player_me.deck.deck || player_me.deck;
+        const opDeckArr = player_op.deck.cards || player_op.deck.deck || player_op.deck;
+
+        // Pre-calculate the exact 10 cards that will be drawn from the top (end) of the decks
+        const myTop10 = myDeckArr.slice(-10).map(c => String(c.id || c.index));
+        const opTop10 = opDeckArr.slice(-10).map(c => String(c.id || c.index));
+
+        this.firstPlayer = await this.coinToss();
+        const startingPlayer = (this.firstPlayer === player_me) ? "me" : "op";
+
+        const payload = {
+            type: 'GAME_START_SYNC',
+            firstPlayerTag: startingPlayer,
+            myHandIndices: myTop10, 
+            opHandIndices: opTop10
+        };
+
+        console.log("Host: Pre-calculated sync payload. Sending:", payload);
+        connection.send(payload);
+
+        console.log("Host: Drawing natural hands...");
+        // NOW we do the drawing animations
+        for(let i = 0; i < 10; i++) {
+            await Promise.all([
+                player_me.deck.draw(player_me.hand),
+                player_op.deck.draw(player_op.hand)
+            ]);
+        }
+
+        await this.runEffects(this.gameStart);
+        await this.initialRedraw();
+    } else {
+        console.log("Guest: Board ready. Waiting for Host's card sync...");
+        // Guest waits for 'GAME_START_SYNC' message from PeerJS
+		// We are assigning the unpause function to 'window.resolveGameSync'
+		await new Promise(resolve => {
+			window.resolveGameSync = resolve;
+		});
+		// CRITICAL FIX: You must have these 3 lines here so the Guest engine continues!
+                await this.runEffects(this.gameStart);
+                await this.coinToss();
+                await this.initialRedraw();
+    }
+}
 	
-	// Simulated coin toss to determine who starts game
-	async coinToss(){
-		this.firstPlayer = (Math.random() < 0.5) ? player_me : player_op;
-		await ui.notification(this.firstPlayer.tag + "-coin", 1200);
-		return this.firstPlayer;
-	}
+async coinToss(){
+        // MULTIPLAYER MOD:
+        if (typeof connection !== 'undefined' && connection && connection.open) {
+            
+            if (!window.amIHost) { // Check amIHost!
+                console.log("Guest: Reached Coin Toss phase in engine.");
+                
+                // If the network message arrived early and is waiting for us:
+                if (window.pendingCoinTossData) {
+                    console.log("Guest: Found pending Coin Toss data! Applying immediately.");
+                    this.firstPlayer = (window.pendingCoinTossData.starter === 'player_me') ? player_me : player_op;
+                    window.pendingCoinTossData = null; // clear it
+                    await ui.notification(this.firstPlayer.tag + "-coin", 1200);
+                    return this.firstPlayer;
+                }
+
+                // If the message hasn't arrived yet, pause and wait:
+                console.log("Guest: Freezing game loop. Waiting for Host's coin toss...");
+                return new Promise((resolve) => {
+                    window.resolveCoinToss = resolve; 
+                });
+
+            } else {
+                // Host flips the coin
+                this.firstPlayer = (Math.random() < 0.5) ? player_me : player_op;
+                let guestPerspective = (this.firstPlayer === player_me) ? 'player_op' : 'player_me';
+                
+                console.log("Network: Host flipped coin. Sending COIN_TOSS.");
+                connection.send({ 
+                    type: 'COIN_TOSS', 
+                    starter: guestPerspective 
+                });
+                
+                await ui.notification(this.firstPlayer.tag + "-coin", 1200);
+                return this.firstPlayer;
+            }
+        }
+
+        // Single Player Fallback
+        this.firstPlayer = (Math.random() < 0.5) ? player_me : player_op;
+        await ui.notification(this.firstPlayer.tag + "-coin", 1200);
+        return this.firstPlayer;
+    }
 	
-	// Allows the player to swap out up to two cards from their iniitial hand
-	async initialRedraw(){
-		for (let i=0; i< 2; i++)
-			player_op.controller.redraw();
-		await ui.queueCarousel(player_me.hand, 2, async (c, i) => await player_me.deck.swap(c, c.removeCard(i)), c => true, true, true, "Choose up to 2 cards to redraw.");
-		ui.enablePlayer(false);
-		game.startRound();
-	}
+// Allows the player to swap out up to two cards from their initial hand
+    async initialRedraw() {
+        console.log("Game: Starting initial redraw (Mulligan) phase.");
+
+        // 1. AI Redraw Logic (Skip if playing multiplayer)
+        if (typeof connection !== 'undefined' && connection && connection.open) {
+            console.log("Multiplayer: Skipping AI redraw logic for human opponent.");
+        } else {
+            console.log("Singleplayer: Running AI redraw.");
+            for (let i = 0; i < 2; i++) {
+                if (player_op.controller && typeof player_op.controller.redraw === 'function') {
+                    player_op.controller.redraw();
+                }
+            }
+        }
+
+       // 2. Human Redraw UI
+        console.log("Triggering local redraw carousel UI...");
+        await ui.queueCarousel(
+            player_me.hand, 
+            2, 
+            async (c, i) => {
+                // Safely grab the ID whether it's a function or a property
+                const getCardId = (cardObj) => {
+                    if (!cardObj) return "undefined";
+                    if (typeof cardObj.id === 'function') return String(cardObj.id());
+                    return String(cardObj.id || cardObj.index);
+                };
+
+                // Run the native engine swap FIRST to get the definitive card object
+                let removedCard = c.removeCard(i);
+                
+                // NOW grab the ID directly from the actual removed card object!
+                let cardOutId = getCardId(removedCard);
+                
+                await player_me.deck.swap(c, removedCard);
+                
+                // Find the new card that was just added to the end of our hand array
+                let handArray = player_me.hand.cards || player_me.hand;
+                let newCard = handArray[handArray.length - 1];
+                let cardInId = getCardId(newCard);
+                
+                // Send the exact swap details to the opponent!
+                if (typeof connection !== 'undefined' && connection && connection.open) {
+                    console.log(`Network: Sending MULLIGAN_SWAP (Out: ${cardOutId}, In: ${cardInId})`);
+                    connection.send({
+                        type: 'MULLIGAN_SWAP',
+                        cardOut: cardOutId,
+                        cardIn: cardInId
+                    });
+                }
+            }, 
+            c => true, 
+            true, 
+            true, 
+            "Choose up to 2 cards to redraw."
+        );
+        
+        console.log("Local redraw complete.");
+        ui.enablePlayer(false);
+        game.startRound();
+    }
 	
-	// Initiates a new round of the game
-	async startRound(){
-		this.roundCount++;
-		this.currPlayer = (this.roundCount%2 === 0) ? this.firstPlayer : this.firstPlayer.opponent();
-		await this.runEffects(this.roundStart);
-		
-		if ( !player_me.canPlay() )
-			player_me.setPassed(true);
-		if ( !player_op.canPlay() )
-			player_op.setPassed(true);
-		
-		if (player_op.passed && player_me.passed)
-			return this.endRound();
-		
-		if (this.currPlayer.passed)
-			this.currPlayer = this.currPlayer.opponent();
-		
-		await ui.notification("round-start", 1200);
-		if (this.currPlayer.opponent().passed)
-			await ui.notification(this.currPlayer.tag + "-turn", 1200);
-		
-		this.startTurn();
-	}
+// Initiates a new round of the game
+    async startRound(){
+        this.roundCount++;
+        
+        // RESTORED: Must be !== 0 so Round 1 (odd number) goes to the winner
+        this.currPlayer = (this.roundCount % 2 !== 0) ? this.firstPlayer : this.firstPlayer.opponent();
+        
+        await this.runEffects(this.roundStart);
+        
+        if ( !player_me.canPlay() )
+            player_me.setPassed(true);
+        if ( !player_op.canPlay() )
+            player_op.setPassed(true);
+        
+        if (player_op.passed && player_me.passed)
+            return this.endRound();
+        
+        if (this.currPlayer.passed)
+            this.currPlayer = this.currPlayer.opponent();
+        
+        await ui.notification("round-start", 1200);
+        if (this.currPlayer.opponent().passed)
+            await ui.notification(this.currPlayer.tag + "-turn", 1200);
+        
+        this.startTurn();
+    }
 	
 	// Starts a new turn. Enables client interraction in client's turn.
 	async startTurn() {
@@ -2380,36 +2548,67 @@ class DeckMaker {
 		this.stats = {};
 	}
 	
-	// Verifies current deck, creates the players and their decks, then starts a new game
-	startNewGame(){
-		let warning = "";
-		if (this.stats.units < 22)
-			warning += "Your deck must have at least 22 unit cards. \n";
-		if (this.stats.special > 10)
-			warning += "Your deck must have no more than 10 special cards. \n";
-		if (warning != "")
-			return alert(warning);
-		
-		let me_deck = { 
-			faction: this.faction,
-			leader: card_dict[this.leader.index], 
-			cards: this.deck.filter(x => x.count > 0)
-		};
-		
-		let op_deck = JSON.parse( premade_deck[randomInt(Object.keys(premade_deck).length)] );
-		op_deck.cards = op_deck.cards.map(c => ({index:c[0], count:c[1]}) );
-		//op_deck.leader = card_dict[op_deck.leader];
-		
-		let leaders = card_dict.filter(c => c.row === "leader" && c.deck === op_deck.faction);
-		op_deck.leader = leaders[randomInt(leaders.length)];
-		//op_deck.leader = card_dict.filter(c => c.row === "leader")[12];
-		
-		player_me = new Player(0, "Player 1", me_deck );
-		player_op = new Player(1, "Player 2", op_deck);
-		
-		this.elem.classList.add("hide");
-		game.startGame();
-	}
+// Verifies current deck, creates the players and their decks, then starts a new game
+    startNewGame(){
+        let warning = "";
+        if (this.stats.units < 22)
+            warning += "Your deck must have at least 22 unit cards. \n";
+        if (this.stats.special > 10)
+            warning += "Your deck must have no more than 10 special cards. \n";
+        if (warning != "")
+            return alert(warning);
+        
+        let me_deck = { 
+            faction: this.faction,
+            leader: card_dict[this.leader.index], 
+            cards: this.deck.filter(x => x.count > 0)
+        };
+
+        // MULTIPLAYER MOD: Intercept the start if we are connected
+        if (typeof connection !== 'undefined' && connection && connection.open) {
+            // We only send basic data (indices) to avoid crashing the network with complex HTML elements
+            let networkSafeDeck = {
+                faction: this.faction,
+                leaderIndex: this.leader.index,
+                cards: me_deck.cards.map(c => ({index: c.index, count: c.count}))
+            };
+            
+            connection.send({ type: 'DECK_SYNC', deck: networkSafeDeck });
+            console.log("Network: Sent our deck to opponent.");
+            
+            // Save our deck to the window so we can start once the opponent replies
+            window.myDeckData = me_deck;
+            
+            // Change the button so the user knows we are waiting
+            let btn = document.getElementById("start-game");
+            btn.innerText = "Waiting for opponent...";
+            btn.style.pointerEvents = "none"; 
+
+            // If the opponent already sent their deck, start the game immediately!
+            if (window.opponentDeckData) {
+               // OLD: window.startMultiplayerMatch(this.elem);
+				// NEW: Just wait. The Guest will send 'GUEST_READY' after they click start.
+				if (window.opponentDeckData) {
+					window.startMultiplayerMatch(this.elem);
+					if (!window.isHost) connection.send({ type: 'GUEST_READY' });
+				}
+            }
+            return; // Stop here so we don't accidentally load the AI
+        }
+        
+        // --- OFFLINE / SINGLE PLAYER LOGIC (Preserved) ---
+        let op_deck = JSON.parse( premade_deck[randomInt(Object.keys(premade_deck).length)] );
+        op_deck.cards = op_deck.cards.map(c => ({index:c[0], count:c[1]}) );
+        
+        let leaders = card_dict.filter(c => c.row === "leader" && c.deck === op_deck.faction);
+        op_deck.leader = leaders[randomInt(leaders.length)];
+        
+        player_me = new Player(0, "Player 1", me_deck );
+        player_op = new Player(1, "Player 2", op_deck);
+        
+        this.elem.classList.add("hide");
+        game.startGame();
+    }
 	
 	// Converts the current deck to a JSON string
 	deckToJSON(){
@@ -2667,6 +2866,29 @@ function sleepUntil(predicate, ms) {
 // Initializes the interractive YouTube object
 function onYouTubeIframeAPIReady() {
 	ui.initYouTube();
+}
+
+window.startMultiplayerMatch = function(uiElementToHide) {
+    console.log("Network: Starting match as " + (window.amIHost ? "Host" : "Guest"));
+    
+    let op_deck = {
+        faction: window.opponentDeckData.faction,
+        leader: card_dict[window.opponentDeckData.leaderIndex],
+        cards: window.opponentDeckData.cards
+    };
+
+    // FIX: Both players MUST be Player 0 locally to play on the bottom half of their own screen!
+    player_me = new Player(0, window.amIHost ? "Host" : "Guest", window.myDeckData);
+    player_op = new Player(1, window.amIHost ? "Guest" : "Host", op_deck);
+    
+    player_op.controller = null; 
+
+    // Hide menus
+    if(uiElementToHide) uiElementToHide.classList.add("hide");
+    else document.getElementById("deck-customization").classList.add("hide");
+    document.getElementById("multiplayer-menu").style.display = "none";
+    
+    game.startGame();
 }
 
 /*----------------------------------------------------*/
