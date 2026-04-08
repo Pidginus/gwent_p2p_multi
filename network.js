@@ -82,6 +82,17 @@ window.injectMultiplayerHooks = function() {
     window.networkCarouselChoices = [];
     window.isReceivingNetworkCards = false;
 
+    // PREVENT DOUBLE-START CRASHES
+    if (typeof window.startMultiplayerMatch === 'function' && !window.networkStartMatchHooked) {
+        window.networkStartMatchHooked = true;
+        const origStartMatch = window.startMultiplayerMatch;
+        window.startMultiplayerMatch = function(...args) {
+            if (window.networkGameStartedFlag) return; 
+            window.networkGameStartedFlag = true;
+            return origStartMatch.apply(this, args);
+        };
+    }
+
     if (typeof Player !== 'undefined') {
         const origPlayCard = Player.prototype.playCard;
         Player.prototype.playCard = async function(...args) {
@@ -100,21 +111,49 @@ window.injectMultiplayerHooks = function() {
         }
     }
 
+    // NATIVE SCOIA'TAEL & COIN TOSS DELEGATION
     const origCoinToss = Game.prototype.coinToss;
     Game.prototype.coinToss = async function(...args) {
-        if (window.amIHost) {
-            window.networkHostStarts = (Math.random() < 0.5);
-            this.firstPlayer = window.networkHostStarts ? player_me : player_op;
+        let pMeFac = player_me.deck.faction;
+        let pOpFac = player_op.deck.faction;
+        let bothScoiatael = (pMeFac === "scoiatael" && pOpFac === "scoiatael");
+
+        // 1. Standard 50/50. Host decides, Guest waits.
+        if (bothScoiatael || (pMeFac !== "scoiatael" && pOpFac !== "scoiatael")) {
+            if (window.amIHost) {
+                window.networkHostStarts = (Math.random() < 0.5);
+                this.firstPlayer = window.networkHostStarts ? player_me : player_op;
+                if (connection && connection.open) {
+                    connection.send({ type: 'COIN_TOSS_TRUTH', hostStarts: window.networkHostStarts });
+                }
+                this.currPlayer = this.firstPlayer;
+                return await ui.notification(this.firstPlayer.tag + "-coin", 1200);
+            } else {
+                if (window.networkHostStarts === undefined) {
+                    await new Promise(resolve => window.resolveCoinTruth = resolve);
+                }
+                this.firstPlayer = window.networkHostStarts ? player_op : player_me;
+                this.currPlayer = this.firstPlayer;
+                return await ui.notification(this.firstPlayer.tag + "-coin", 1200);
+            }
+        }
+        
+        // 2. We are Scoia'tael. Use native UI to choose.
+        if (pMeFac === "scoiatael") {
+            await origCoinToss.apply(this, args);
+            window.networkHostStarts = (this.firstPlayer === player_me) ? window.amIHost : !window.amIHost;
             if (connection && connection.open) {
                 connection.send({ type: 'COIN_TOSS_TRUTH', hostStarts: window.networkHostStarts });
             }
             this.currPlayer = this.firstPlayer;
-            return await ui.notification(this.firstPlayer.tag + "-coin", 1200);
-        } else {
+            return; 
+        } 
+        // 3. Opponent is Scoia'tael. Wait for their decision.
+        else {
             if (window.networkHostStarts === undefined) {
                 await new Promise(resolve => window.resolveCoinTruth = resolve);
             }
-            this.firstPlayer = window.networkHostStarts ? player_op : player_me;
+            this.firstPlayer = window.networkHostStarts ? (window.amIHost ? player_me : player_op) : (window.amIHost ? player_op : player_me);
             this.currPlayer = this.firstPlayer;
             return await ui.notification(this.firstPlayer.tag + "-coin", 1200);
         }
@@ -139,7 +178,7 @@ window.injectMultiplayerHooks = function() {
                 connection.send(syncPayload);
             }
             
-            // DEFERRED HAND SYNC: We safely align the opponent's hand here, when NO carousels can be open.
+            // DEFERRED HAND SYNC
             if (window.networkPendingOpHand) {
                 console.log("NETWORK: Safely syncing opponent's hand post-mulligan...");
                 let opDeckArr = player_op.deck.cards || player_op.deck.deck || player_op.deck;
@@ -191,12 +230,6 @@ window.injectMultiplayerHooks = function() {
             }
         }
         
-        // This safely skips opponent's errant background prompts, but allows round 0 (Mulligan) to proceed natively.
-        if (typeof game !== 'undefined' && game && game.currPlayer === player_op && game.round > 0) {
-            let validCard = (cards && Array.isArray(cards)) ? cards.find(c => c !== undefined && c !== null) : null;
-            return validCard; 
-        }
-
         window.activeCarousels = (window.activeCarousels || 0) + 1;
         let chosen = null;
         try {
@@ -252,7 +285,6 @@ window.injectMultiplayerHooks = function() {
 
                 let playedRowIndex = null;
 
-                // ABSOLUTE ROW SCANNER: Find exactly where Agile/Horn cards were naturally placed on the board by the engine
                 if (primaryCardObj) {
                     for (let r = 0; r < 6; r++) {
                         if (board.row[r] && board.row[r].cards && board.row[r].cards.includes(primaryCardObj)) {
@@ -330,7 +362,6 @@ window.setupConnection = function() {
         if (data.type === 'ROUND_SYNC') {
             window.networkOpponentReadyForRound = true;
             if (data.finalHand && data.finalHand.length > 0) {
-                // Save the data to be securely executed during startRound
                 window.networkPendingOpHand = data.finalHand;
             }
 
@@ -345,14 +376,13 @@ window.setupConnection = function() {
         else if (data.type === 'DECK_SYNC') {
             window.opponentDeckData = data.deck;
             if (window.myDeckData && !window.amIHost) {
-                window.startMultiplayerMatch();
+                if (typeof window.startMultiplayerMatch === 'function') window.startMultiplayerMatch();
                 connection.send({ type: 'GUEST_READY' });
             }
         }
         else if (data.type === 'GUEST_READY') {
-            if (window.amIHost && !window.gameStarted) {
-                window.gameStarted = true; 
-                window.startMultiplayerMatch(); 
+            if (window.amIHost && !window.networkGameStartedFlag) {
+                if (typeof window.startMultiplayerMatch === 'function') window.startMultiplayerMatch();
             }
         }
         else if (data.type === 'TURN_ACTION_V2') {
@@ -374,7 +404,7 @@ window.setupConnection = function() {
                     if (cardToPlayIndex !== -1) {
                         let cardToPlay = opHandArr[cardToPlayIndex];
 
-                        // --- DECOY (MANNEKIN) INTERCEPTOR ---
+                        // --- DECOY INTERCEPTOR ---
                         let isDecoy = (cardToPlay.name === "Decoy" || cardToPlay.id === "decoy" || (cardToPlay.abilities && cardToPlay.abilities.includes("decoy")));
                         if (isDecoy && data.addedCards && data.addedCards.length > 0) {
                             let targetData = data.addedCards[0];
@@ -435,13 +465,11 @@ window.setupConnection = function() {
                         try { 
                             let targetRow = null;
                             if (data.targetRowIndex !== undefined && data.targetRowIndex !== null && data.targetRowIndex >= 0 && data.targetRowIndex < 6) {
-                                // PERFECT MIRROR MATH: Maps Melee->OpMelee, Ranged->OpRanged, Siege->OpSiege
                                 let mappedIndex = 5 - data.targetRowIndex; 
                                 targetRow = board.row[mappedIndex];
                             }
 
                             if (targetRow && typeof player_op.playCardToRow === 'function') {
-                                console.log("NETWORK: Agile/Targeted card detected. Forcing to row index:", board.row.indexOf(targetRow));
                                 await player_op.playCardToRow(cardToPlay, targetRow);
                             } else {
                                 await player_op.playCard(cardToPlay); 

@@ -126,29 +126,32 @@ var ability_dict = {
         placed: async (card) => {
             let grave = board.getRow(card, "grave", card.holder);
             let units = card.holder.grave.findCards(c => c.isUnit());
-            if (units.length <= 0)
-                return;
+            if (units.length <= 0) return;
                 
             let wrapper = {card : null};
             
-            if (game.randomRespawn) {
-                 wrapper.card = grave.findCardsRandom(c => c.isUnit())[0];
-            } else if (card.holder.controller instanceof ControllerAI) {
-                wrapper.card = card.holder.controller.medic(card, grave);
-            } else if (window.isReceivingNetworkCards) {
-                // NETWORK RECEIVER: Pull from payload directly, bypass UI
+            if (window.isReceivingNetworkCards) {
+                // NETWORK RECEIVER: Pull from payload directly
                 let expectedData = (window.networkCarouselChoices || []).shift();
                 wrapper.card = window.deserializeCarouselChoice(expectedData, units) || units[0];
             } else {
-                // LOCAL SENDER: Trigger UI and save choice for broadcast
-                await ui.queueCarousel(card.holder.grave, 1, (c, i) => wrapper.card=c.cards[i], c => c.isUnit(), true);
+                // LOCAL SENDER: Figure out what card to pick
+                if (game.randomRespawn) {
+                     wrapper.card = grave.findCardsRandom(c => c.isUnit())[0];
+                } else if (card.holder.controller instanceof ControllerAI) {
+                    wrapper.card = card.holder.controller.medic(card, grave);
+                } else {
+                    await ui.queueCarousel(card.holder.grave, 1, (c, i) => wrapper.card=c.cards[i], c => c.isUnit(), true);
+                }
+                
+                // SERIALIZATION FIX: Always broadcast the choice, even if RNG picked it!
                 if (window.serializeCarouselChoice && !window.blockNetworkBroadcast && wrapper.card) {
                     window.networkCarouselChoices.push(window.serializeCarouselChoice(wrapper.card, units));
                 }
             }
             
             let res = wrapper.card;
-            if (!res) return; // Failsafe in case player canceled carousel
+            if (!res) return; 
             
             grave.removeCard(res);
             grave.addCard(res);
@@ -231,8 +234,11 @@ var ability_dict = {
     emhyr_emperor: {
         description: "Look at 3 random cards from your opponent's hand.",
         activated: async card => {
-            if (card.holder.controller instanceof ControllerAI)
-                return;
+            if (card.holder.controller instanceof ControllerAI) return;
+            
+            // NETWORK FIX: Prevent the opponent's engine from revealing your hand to them!
+            if (window.isReceivingNetworkCards) return; 
+
             let container = new CardContainer();
             container.cards = card.holder.opponent().hand.findCardsRandom(() => true, 3);
             if (Carousel && Carousel.curr) Carousel.curr.cancel();
