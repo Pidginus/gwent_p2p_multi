@@ -139,6 +139,34 @@ window.injectMultiplayerHooks = function() {
                 connection.send(syncPayload);
             }
             
+            // DEFERRED HAND SYNC: We safely align the opponent's hand here, when NO carousels can be open.
+            if (window.networkPendingOpHand) {
+                console.log("NETWORK: Safely syncing opponent's hand post-mulligan...");
+                let opDeckArr = player_op.deck.cards || player_op.deck.deck || player_op.deck;
+                let opHandArr = player_op.hand.cards || player_op.hand;
+                
+                let cardsToReturn = [...opHandArr];
+                for (let c of cardsToReturn) {
+                    if (typeof player_op.hand.removeCard === 'function') player_op.hand.removeCard(c);
+                    else {
+                        let idx = opHandArr.indexOf(c);
+                        if (idx > -1) opHandArr.splice(idx, 1);
+                    }
+                    opDeckArr.push(c);
+                }
+
+                for (let target of window.networkPendingOpHand) {
+                    let cIdx = opDeckArr.findIndex(c => window.matchCard(c, target));
+                    if (cIdx !== -1) {
+                        let foundCard = opDeckArr.splice(cIdx, 1)[0];
+                        if (typeof player_op.hand.addCard === 'function') player_op.hand.addCard(foundCard);
+                        else opHandArr.push(foundCard);
+                    }
+                }
+                window.networkPendingOpHand = null;
+                console.log("NETWORK: Opponent hand forcefully aligned.");
+            }
+
             if(statusEl) statusEl.innerText = "Game in progress...";
             window.networkOpponentReadyForRound = false; 
         }
@@ -153,17 +181,22 @@ window.injectMultiplayerHooks = function() {
 
     const origQueueCarousel = ui.queueCarousel;
     ui.queueCarousel = async function(cards, ...args) {
-        // If we are actively simulating the opponent's turn, auto-resolve using captured choices
         if (window.isReceivingNetworkCards) {
             if (window.networkCarouselChoices && window.networkCarouselChoices.length > 0) {
                 let expectedData = window.networkCarouselChoices.shift();
                 return window.deserializeCarouselChoice(expectedData, cards);
             } else {
-                return (cards && Array.isArray(cards) && cards.length) ? cards.find(c => c !== undefined && c !== null) : null;
+                let validCard = (cards && Array.isArray(cards)) ? cards.find(c => c !== undefined && c !== null) : null;
+                return validCard;
             }
         }
         
-        // Otherwise, allow the local human UI to proceed (fixes the missing Mulligan phase!)
+        // This safely skips opponent's errant background prompts, but allows round 0 (Mulligan) to proceed natively.
+        if (typeof game !== 'undefined' && game && game.currPlayer === player_op && game.round > 0) {
+            let validCard = (cards && Array.isArray(cards)) ? cards.find(c => c !== undefined && c !== null) : null;
+            return validCard; 
+        }
+
         window.activeCarousels = (window.activeCarousels || 0) + 1;
         let chosen = null;
         try {
@@ -172,8 +205,7 @@ window.injectMultiplayerHooks = function() {
             window.activeCarousels = Math.max(0, window.activeCarousels - 1);
         }
         
-        // Record our choice to broadcast to the opponent
-        if (chosen && !window.blockNetworkBroadcast) {
+        if (chosen && typeof game !== 'undefined' && game && game.currPlayer === player_me && game.round > 0 && !window.blockNetworkBroadcast) {
             window.networkCarouselChoices.push(window.serializeCarouselChoice(chosen, cards));
         }
         return chosen;
@@ -220,10 +252,10 @@ window.injectMultiplayerHooks = function() {
 
                 let playedRowIndex = null;
 
-                // FULLPROOF ROW SCANNER: Find the card on the board right now!
+                // ABSOLUTE ROW SCANNER: Find exactly where Agile/Horn cards were naturally placed on the board by the engine
                 if (primaryCardObj) {
                     for (let r = 0; r < 6; r++) {
-                        if (board.row[r].cards.includes(primaryCardObj)) {
+                        if (board.row[r] && board.row[r].cards && board.row[r].cards.includes(primaryCardObj)) {
                             playedRowIndex = r;
                             break;
                         }
@@ -296,31 +328,12 @@ window.setupConnection = function() {
 
     connection.on('data', (data) => {
         if (data.type === 'ROUND_SYNC') {
+            window.networkOpponentReadyForRound = true;
             if (data.finalHand && data.finalHand.length > 0) {
-                let opDeckArr = player_op.deck.cards || player_op.deck.deck || player_op.deck;
-                let opHandArr = player_op.hand.cards || player_op.hand;
-                
-                let cardsToReturn = [...opHandArr];
-                for (let c of cardsToReturn) {
-                    if (typeof player_op.hand.removeCard === 'function') player_op.hand.removeCard(c);
-                    else {
-                        let idx = opHandArr.indexOf(c);
-                        if (idx > -1) opHandArr.splice(idx, 1);
-                    }
-                    opDeckArr.push(c);
-                }
-
-                for (let target of data.finalHand) {
-                    let cIdx = opDeckArr.findIndex(c => window.matchCard(c, target));
-                    if (cIdx !== -1) {
-                        let foundCard = opDeckArr.splice(cIdx, 1)[0];
-                        if (typeof player_op.hand.addCard === 'function') player_op.hand.addCard(foundCard);
-                        else opHandArr.push(foundCard);
-                    }
-                }
+                // Save the data to be securely executed during startRound
+                window.networkPendingOpHand = data.finalHand;
             }
 
-            window.networkOpponentReadyForRound = true;
             if (window.resolveNetworkStartRound) {
                 window.resolveNetworkStartRound();
                 window.resolveNetworkStartRound = null;
@@ -421,9 +434,9 @@ window.setupConnection = function() {
 
                         try { 
                             let targetRow = null;
-                            // Map the Sender's row index to the Receiver's perspective
                             if (data.targetRowIndex !== undefined && data.targetRowIndex !== null && data.targetRowIndex >= 0 && data.targetRowIndex < 6) {
-                                let mappedIndex = (data.targetRowIndex + 3) % 6;
+                                // PERFECT MIRROR MATH: Maps Melee->OpMelee, Ranged->OpRanged, Siege->OpSiege
+                                let mappedIndex = 5 - data.targetRowIndex; 
                                 targetRow = board.row[mappedIndex];
                             }
 
